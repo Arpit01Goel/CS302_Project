@@ -1,459 +1,375 @@
-#include <iostream>
-#include <cmath>
-#include <vector>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <algorithm>
-#include <limits>
+// simplex_clrs_debug.cpp
+// Instrumented CLRS two-phase simplex: prints detailed Phase I/Phase II traces for debugging.
+
+#include <bits/stdc++.h>
 using namespace std;
 
+enum class SolveStatus { OPTIMAL, UNBOUNDED, INFEASIBLE };
+struct SimplexResult { SolveStatus status; vector<double> x; double objective; };
 
-class Simplex
-{
-private:
-    int rows, cols;
-    // Stores coefficients of all the variables
-    vector<vector<float>> A;
-    // Stores constants of constraints
-    vector<float> B;
-    // Stores the coefficients of the objective function
-    vector<float> C;
-
-    float maximum;
-
-    bool isUnbounded;
-    vector<float> solution;
-
+static bool DEBUG = true; // set true to print traces
+static string DEBUG_CASE_FILENAME = ""; // if non-empty only print traces for that input file
+#define epsilion 1e-12
+class SimplexCLRS {
 public:
-    Simplex(vector<vector<float>> matrix, vector<float> b, vector<float> c)
+    SimplexCLRS(int n, int m, const vector<vector<double>>& A_in, const vector<double>& b_in,
+                const vector<string>& relations_in, bool maximize=true)
+        : n_orig(n), m(m), maximize(maximize)
     {
-        maximum = 0;
-        isUnbounded = false;
-        rows = (int)matrix.size();
-        cols = (rows > 0 ? (int)matrix[0].size() : 0);
+        A_input = A_in;
+        b_input = b_in;
+        relations = relations_in;
+        normalizeConstraints();
+        buildTableau();
+    }
 
-        // initialize A, B, C
-        A.assign(rows, vector<float>(cols, 0.0f));
-        B.assign(b.begin(), b.end());
-        C.assign(c.begin(), c.end());
+    void setOriginalObjective(const vector<double>& c_in) {
+        orig_c.assign(total_vars, 0.0);
+        for (int j = 0; j < (int)c_in.size() && j < n_orig; ++j) {
+            orig_c[j] = (maximize ? c_in[j] : -c_in[j]);
+        }
+    }
 
-        // copy matrix safely (in case provided matrix has consistent dimensions)
-        for (int i = 0; i < rows; i++)
-        {
-            for (int j = 0; j < cols; j++)
-            {
-                A[i][j] = matrix[i][j];
+    SimplexResult solve(const string &inputName = "") {
+        // store input name for conditional debug printing
+        input_label = inputName;
+        if (artificial_vars_count > 0) {
+            if (!phaseI()) {
+                return {SolveStatus::INFEASIBLE, vector<double>(n_orig,0.0), NAN};
             }
         }
+        return phaseII();
+    }
 
-        // ensure B size matches rows
-        if ((int)B.size() != rows)
-        {
-            B.assign(rows, 0.0f);
+private:
+    // Input
+    int n_orig;
+    int m;
+    bool maximize;
+    string input_label;
+
+    vector<vector<double>> A_input;
+    vector<double> b_input;
+    vector<string> relations;
+
+    // tableau and bookkeeping
+    int total_vars = 0;
+    int slack_count = 0;
+    int artificial_count = 0;
+    int artificial_vars_count = 0;
+    vector<int> col_type; // 0 original, 1 slack/surplus, 3 artificial
+    vector<int> artificial_cols;
+
+    vector<vector<double>> T; // (m+1) x (total_vars+1)
+    vector<int> basis; // size m
+    vector<double> orig_c;
+
+    // helpers
+    static string colTypeName(int t){
+        if (t==0) return "orig";
+        if (t==1) return "slack/sur";
+        if (t==3) return "arti";
+        return "unknown";
+    }
+
+    void dbgPrint(const string &s) const {
+        if (!DEBUG) return;
+        if (!DEBUG_CASE_FILENAME.empty() && input_label != DEBUG_CASE_FILENAME) return;
+        cerr << s;
+    }
+
+    void dbgTableau(const string &title) const {
+        if (!DEBUG) return;
+        if (!DEBUG_CASE_FILENAME.empty() && input_label != DEBUG_CASE_FILENAME) return;
+        cerr << "=== " << title << " ===\n";
+        // header
+        for (int j=0;j<total_vars;j++) {
+            string hd = (j < n_orig ? ("x"+to_string(j+1)) : ("v"+to_string(j+1)));
+            cerr << hd << "\t";
         }
-        // ensure C size matches cols
-        if ((int)C.size() != cols)
-        {
-            C.assign(cols, 0.0f);
+        cerr << "| RHS\n";
+        for (int i=0;i<m;i++){
+            for (int j=0;j<total_vars;j++){
+                cerr << fixed << setprecision(6) << T[i][j] << "\t";
+            }
+            cerr << "| " << T[i][total_vars] << "\n";
+        }
+        cerr << "C: ";
+        for (int j=0;j<total_vars;j++) cerr << fixed << setprecision(6) << T[m][j] << " ";
+        cerr << "| " << T[m][total_vars] << "\n";
+        cerr << "Basis cols: ";
+        for (int i=0;i<m;i++) cerr << basis[i] << (i+1<=m-1? ",":"");
+        cerr << "\n";
+    }
+
+    void normalizeConstraints() {
+        for (int i = 0; i < m; ++i) {
+            if (b_input[i] < epsilion) {
+                for (int j = 0; j < n_orig; ++j) A_input[i][j] = -A_input[i][j];
+                b_input[i] = -b_input[i];
+                if (relations[i] == "<=") relations[i] = ">=";
+                else if (relations[i] == ">=") relations[i] = "<=";
+            }
         }
     }
 
-    bool simplexAlgorithmCalculataion()
-    {
-        // Check whether the table is optimal, if optimal no need to process further
-        if (checkOptimality() == true)
-        {
-            return true;
+    void buildTableau() {
+        col_type.assign(n_orig, 0);
+        int slack_index = n_orig;
+        // count slacks & artificials
+        for (int i = 0; i < m; ++i) {
+            if (relations[i] == "<=") slack_count++;
+            else if (relations[i] == ">=") { slack_count++; artificial_count++; }
+            else { artificial_count++; }
         }
-
-        // Find the column which has the pivot. The least coefficient of the objective function(C array).
-        int pivotColumn = findPivotColumn();
-
-        // If no negative reduced cost found -> optimal
-        if (pivotColumn == -1)
-        {
-            return true;
+        total_vars = n_orig + slack_count + artificial_count;
+        col_type.resize(total_vars, 0);
+        for (int j = n_orig; j < n_orig + slack_count; ++j) col_type[j] = 1;
+        artificial_cols.clear();
+        int arti_start = n_orig + slack_count;
+        for (int j = arti_start; j < n_orig + slack_count + artificial_count; ++j){
+            col_type[j] = 3;
+            artificial_cols.push_back(j);
         }
+        artificial_vars_count = (int)artificial_cols.size();
+        T.assign(m+1, vector<double>(total_vars+1, 0.0));
+        basis.assign(m, -1);
+        orig_c.assign(total_vars, 0.0);
 
-        if (isUnbounded == true)
-        {
-            cout << "Error unbounded" << endl;
-            return true;
+        // fill original coef
+        for (int i=0;i<m;i++){
+            for (int j=0;j<n_orig;j++) T[i][j] = A_input[i][j];
         }
-
-        // Find the row with the pivot value. The least value item's row in the B array
-        int pivotRow = findPivotRow(pivotColumn);
-
-        // If no valid pivot row (unbounded), stop
-        if (pivotRow == -1)
-        {
-            cout << "Error unbounded or no valid pivot row" << endl;
-            isUnbounded = true;
-            return true;
+        // add slack/surplus and artificial
+        int sidx = n_orig;
+        int aidx = arti_start;
+        for (int i=0;i<m;i++){
+            if (relations[i] == "<=") {
+                T[i][sidx] = 1.0;
+                basis[i] = sidx;
+                sidx++;
+            } else if (relations[i] == ">=") {
+                T[i][sidx] = -1.0; // surplus
+                T[i][aidx] = 1.0;
+                basis[i] = aidx;
+                sidx++; aidx++;
+            } else {
+                T[i][aidx] = 1.0;
+                basis[i] = aidx;
+                aidx++;
+            }
+            T[i][total_vars] = b_input[i];
         }
-
-        // Form the next table according to the pivot value
-        doPivotting(pivotRow, pivotColumn);
-
-        return false;
     }
 
-    bool checkOptimality()
-    {
-        // If there are no negative coefficients in C then it's optimal
-        for (int i = 0; i < (int)C.size(); ++i)
-        {
-            if (C[i] < -1e-12f) // small tolerance
-                return false;
+    void addRowTimes(int to, int from, double factor) {
+        for (int j=0;j<=total_vars;j++) T[to][j] += factor * T[from][j];
+    }
+
+    bool phaseI() {
+        dbgPrint("START PHASE I\n");
+        dbgTableau("Initial Phase I Tableau (before bottom row build)");
+
+        // Build bottom row for Phase I: we will maximize (- sum of artificials)
+        for (int j=0;j<=total_vars;j++) T[m][j] = 0.0;
+        for (int k : artificial_cols) T[m][k] = -1.0;
+        T[m][total_vars] = 0.0;
+
+        // For each basic artificial, add its row to bottom (to zero-out reduced cost)
+        for (int i=0;i<m;i++) {
+            int bc = basis[i];
+            if (bc >=0 && col_type[bc] == 3) {
+                addRowTimes(m, i, 1.0);
+            }
         }
-        // optimal: print & return true
-        print();
+        dbgTableau("Phase I Tableau after bottom row init");
+
+        SolveStatus st = runSimplexPhase(true);
+        dbgTableau("Phase I Tableau after simplex");
+
+        if (st == SolveStatus::UNBOUNDED) {
+            dbgPrint("PHASE I reported UNBOUNDED (treat as infeasible)\n");
+            return false;
+        }
+        double phase1_obj = T[m][total_vars];
+        dbgPrint("PHASE I objective (should be 0 if feasible): " + to_string(phase1_obj) + "\n");
+        if (fabs(phase1_obj) > 1e-8) {
+            dbgPrint("PHASE I found nonzero objective -> INFEASIBLE\n");
+            return false;
+        }
+
+        // Remove artificial columns from tableau
+        vector<int> colmap(total_vars, -1);
+        int newcols = 0;
+        for (int j=0;j<total_vars;j++) {
+            if (col_type[j] == 3) continue;
+            colmap[j] = newcols++;
+        }
+        vector<vector<double>> newT(m+1, vector<double>(newcols+1, 0.0));
+        for (int i=0;i<=m;i++){
+            for (int j=0;j<total_vars;j++){
+                if (colmap[j] != -1) newT[i][colmap[j]] = T[i][j];
+            }
+            newT[i][newcols] = T[i][total_vars];
+        }
+        // update basis mapping
+        for (int i=0;i<m;i++){
+            if (basis[i] != -1) {
+                if (colmap[basis[i]] == -1) basis[i] = -1;
+                else basis[i] = colmap[basis[i]];
+            }
+        }
+        // update bookkeeping
+        vector<int> newcoltype;
+        for (int j=0;j<total_vars;j++) if (col_type[j] != 3) newcoltype.push_back(col_type[j]);
+        total_vars = newcols;
+        T.swap(newT);
+        col_type.swap(newcoltype);
+        artificial_cols.clear();
+        artificial_vars_count = 0;
+
+        dbgTableau("After removing artificial columns (start Phase II prep)");
         return true;
     }
 
-    void doPivotting(int pivotRow, int pivotColumn)
-    {
-        // validate indices
-        if (pivotRow < 0 || pivotRow >= rows || pivotColumn < 0 || pivotColumn >= cols)
-        {
-            cerr << "[doPivotting] invalid pivot indices: row=" << pivotRow << " col=" << pivotColumn << endl;
-            return;
-        }
-
-        float pivetValue = A[pivotRow][pivotColumn]; // Gets the pivot value
-        if (fabs(pivetValue) < 1e-12f)
-        {
-            cerr << "[doPivotting] pivot value is zero or nearly zero -> aborting pivot\n";
-            return;
-        }
-
-        // Use vectors sized appropriately (avoid VLAs)
-        vector<float> pivotRowVals(cols, 0.0f); // The pivot row
-        vector<float> pivotColVals(rows, 0.0f); // The pivot column
-        vector<float> rowNew(cols, 0.0f);       // The normalized pivot row
-
-        // Update maximum -- the formula follows your earlier approach
-        maximum = maximum - (C[pivotColumn] * (B[pivotRow] / pivetValue));
-
-        // Get the row and column that has the pivot value
-        for (int i = 0; i < cols; i++)
-            pivotRowVals[i] = A[pivotRow][i];
-        for (int j = 0; j < rows; j++)
-            pivotColVals[j] = A[j][pivotColumn];
-
-        // Normalize pivot row (divide by pivot)
-        for (int k = 0; k < cols; k++)
-            rowNew[k] = pivotRowVals[k] / pivetValue;
-
-        // Normalize B[pivotRow]
-        B[pivotRow] = B[pivotRow] / pivetValue;
-
-        // Update other rows: A[m][p] = A[m][p] - pivotColVals[m] * rowNew[p]
-        for (int m = 0; m < rows; m++)
-        {
-            if (m == pivotRow) continue;
-            float multiplyValue = pivotColVals[m];
-            for (int p = 0; p < cols; p++)
-            {
-                A[m][p] = A[m][p] - (multiplyValue * rowNew[p]);
+    SimplexResult phaseII() {
+        dbgPrint("START PHASE II\n");
+        // build bottom row from orig_c: bottom = -orig_c
+        for (int j=0;j<total_vars;j++) T[m][j] = -orig_c[j];
+        T[m][total_vars] = 0.0;
+        // make reduced costs zero for basic vars
+        for (int i=0;i<m;i++){
+            int bc = basis[i];
+            if (bc >=0) {
+                double coeff = orig_c[bc];
+                if (fabs(coeff) > 1e-14) addRowTimes(m, i, coeff);
             }
         }
-
-        // Update B entries (except pivot row)
-        for (int i = 0; i < (int)B.size(); i++)
-        {
-            if (i == pivotRow) continue;
-            float multiplyValue = pivotColVals[i];
-            B[i] = B[i] - (multiplyValue * B[pivotRow]);
+        dbgTableau("Phase II initial tableau");
+        SolveStatus st = runSimplexPhase(false);
+        if (st == SolveStatus::UNBOUNDED) return {SolveStatus::UNBOUNDED, {}, NAN};
+        // read solution
+        vector<double> sol(n_orig, 0.0);
+        for (int i=0;i<m;i++){
+            int bc = basis[i];
+            if (bc >=0 && bc < n_orig) sol[bc] = T[i][total_vars];
         }
-
-        // Update C: C = C - C[pivotColumn] * rowNew
-        float multiplier = C[pivotColumn];
-        for (int i = 0; i < cols; i++)
-        {
-            C[i] = C[i] - (multiplier * rowNew[i]);
-        }
-
-        // After row operations, set pivot column to 0 except pivot row
-        for (int j = 0; j < rows; j++)
-        {
-            if (j == pivotRow) continue;
-            A[j][pivotColumn] = 0.0f;
-        }
-
-        // Set the normalized pivot row back into A
-        for (int i = 0; i < cols; i++)
-            A[pivotRow][i] = rowNew[i];
+        double obj = T[m][total_vars];
+        if (!maximize) obj = -obj;
+        return {SolveStatus::OPTIMAL, sol, obj};
     }
 
-    // Print the current A array and B
-    void print()
-    {
-        cout << "Current tableau (A | B):" << endl;
-        for (int i = 0; i < rows; i++)
-        {
-            for (int j = 0; j < cols; j++)
-            {
-                cout << A[i][j] << " ";
-            }
-            cout << "| " << B[i] << endl;
-        }
-        cout << "C: ";
-        for (int j = 0; j < cols; ++j) cout << C[j] << " ";
-        cout << endl;
-    }
-
-    // Find the least coefficients of constraints in the objective function's position
-    // Return -1 if none negative (optimal)
-    int findPivotColumn()
-    {
-        int location = -1;
-        float minm = 0.0f;
-        for (int i = 0; i < (int)C.size(); i++)
-        {
-            if (C[i] < minm - 1e-12f)
-            {
-                minm = C[i];
-                location = i;
-            }
-        }
-        return location;
-    }
-
-    // Find the row with the pivot value. Returns -1 for unbounded
-    int findPivotRow(int pivotColumn)
-    {
-        if (pivotColumn < 0 || pivotColumn >= cols) return -1;
-
-        vector<float> positiveValues(rows, 0.0f);
-        vector<float> ratios(rows, std::numeric_limits<float>::infinity());
-        int positiveCount = 0;
-
-        for (int i = 0; i < rows; i++)
-        {
-            float val = A[i][pivotColumn];
-            if (val > 1e-12f)
-            {
-                positiveValues[i] = val;
-                // compute ratio
-                if (fabs(val) > 1e-12f)
-                    ratios[i] = B[i] / val;
-                positiveCount++;
-            }
-            else
-            {
-                positiveValues[i] = 0.0f;
-                ratios[i] = std::numeric_limits<float>::infinity();
-            }
-        }
-
-        // If there are no positive entries in the pivot column -> unbounded
-        if (positiveCount == 0)
-        {
-            isUnbounded = true;
-            return -1;
-        }
-
-        // find minimal ratio
-        float minimum = std::numeric_limits<float>::infinity();
-        int location = -1;
-        for (int i = 0; i < rows; ++i)
-        {
-            if (ratios[i] < minimum)
-            {
-                minimum = ratios[i];
-                location = i;
-            }
-        }
-        return location;
-    }
-
-    void CalculateSimplex()
-    {
-        bool end = false;
-
-        cout << "initial array(Not optimal)" << endl;
-        print();
-
-        while (!end)
-        {
-            bool result = simplexAlgorithmCalculataion();
-            if (result)
-                end = true;
-        }
-
-        // compute solution vector (basic variables)
-        solution.assign(cols, 0.0f);
-        for (int col = 0; col < cols; ++col)
-        {
-            int oneIndex = -1;
-            int zeroCount = 0;
-            for (int r = 0; r < rows; ++r)
-            {
-                float v = A[r][col];
-                if (fabs(v - 1.0f) < 1e-9f)
-                {
-                    if (oneIndex == -1) oneIndex = r;
-                    else { oneIndex = -1; break; } // more than one '1', not a basic column
+    SolveStatus runSimplexPhase(bool isPhaseI) {
+        const int MAX_IT = 10000;
+        int it = 0;
+        double tol = 1e-12;
+        while (true) {
+            ++it;
+            if (it > MAX_IT) { dbgPrint("Reached max iterations\n"); return SolveStatus::OPTIMAL; }
+            // find entering: column j with T[m][j] < 0 (improving)
+            bool anyNegative = false;
+            for (int j=0;j<total_vars;j++) if (T[m][j] < -1e-12) { anyNegative = true; break; }
+            int entering = -1, leaving = -1;
+            bool found = false;
+            bool hadNegNoPos = false;
+            for (int j=0;j<total_vars;j++) {
+                if (T[m][j] >= -1e-12) continue;
+                // check for eligible pivot rows
+                int bestRow = -1; double bestRatio = numeric_limits<double>::infinity();
+                for (int i=0;i<m;i++){
+                    double a = T[i][j];
+                    if (a > tol) {
+                        double ratio = T[i][total_vars] / a;
+                        if (ratio < bestRatio - 1e-12) { bestRatio = ratio; bestRow = i; }
+                    }
                 }
-                else if (fabs(v) < 1e-9f)
-                {
-                    zeroCount++;
-                }
+                if (bestRow == -1) { hadNegNoPos = true; continue; }
+                entering = j; leaving = bestRow; found = true;
+                // For determinism (Bland) pick first eligible; break
+                break;
             }
-            if (oneIndex != -1 && zeroCount == rows - 1)
-            {
-                solution[col] = B[oneIndex];
+            if (!found) {
+                if (!anyNegative) return SolveStatus::OPTIMAL;
+                else return SolveStatus::UNBOUNDED;
             }
-            else
-            {
-                solution[col] = 0.0f;
-            }
+            // debug print pivot decision
+            dbgPrint("Pivot: entering col=" + to_string(entering) + " leaving row=" + to_string(leaving) + "\n");
+            // perform pivot
+            pivot(leaving, entering);
+            dbgTableau("After pivot");
         }
-
-        cout << "Answers for the Constraints of variables" << endl;
-        for (int i = 0; i < cols; ++i)
-        {
-            cout << "variable " << (i + 1) << ": " << solution[i] << endl;
-        }
-
-        cout << endl;
-        cout << "maximum value: " << maximum << endl; // print the maximum values
     }
 
-    vector<float> getSolution() const { return solution; }
-    float getMaximum() const { return maximum; }
+    void pivot(int l, int e) {
+        double a = T[l][e];
+        if (fabs(a) < 1e-14) return;
+        for (int j=0;j<=total_vars;j++) T[l][j] /= a;
+        for (int i=0;i<=m;i++) {
+            if (i==l) continue;
+            double factor = T[i][e];
+            if (fabs(factor) > 0.0) {
+                for (int j=0;j<=total_vars;j++) T[i][j] -= factor * T[l][j];
+            }
+        }
+        basis[l] = e;
+    }
 };
 
-// small helper: lowercase
-static inline string toLower(const string &s)
+// parse input file
+bool parse_input_file(const string &filename, int &n, int &m,
+                      vector<vector<double>> &A, vector<double> &b, vector<string> &rels,
+                      vector<double> &c, bool &maximize)
 {
-    string r = s;
-    transform(r.begin(), r.end(), r.begin(), ::tolower);
-    return r;
+    ifstream in(filename);
+    if (!in.is_open()) { cerr << "Cannot open " << filename << "\n"; return false; }
+    string tok; if (!(in>>tok)) return false;
+    string opt = tok; transform(opt.begin(), opt.end(), opt.begin(), ::tolower);
+    maximize = (opt == "max");
+    if (!(in >> m >> n)) { cerr << "Expecting m n\n"; return false; }
+    c.assign(n, 0.0);
+    for (int i=0;i<n;i++) in >> c[i];
+    string line; getline(in, line);
+    A.assign(m, vector<double>(n,0.0));
+    b.assign(m,0.0); rels.assign(m,"<=");
+    for (int i=0;i<m;i++){
+        if (!getline(in, line)) { cerr << "Missing constraints\n"; return false; }
+        if (line.find_first_not_of(" \t\r\n") == string::npos) { --i; continue; }
+        stringstream ss(line);
+        for (int j=0;j<n;j++) ss >> A[i][j];
+        string rel; double rhs; ss >> rel >> rhs;
+        rels[i] = rel; b[i] = rhs;
+    }
+    return true;
 }
 
-
 int main(int argc, char** argv) {
-    std::string filename = "input.txt";
+    string filename = "input.txt";
     if (argc >= 2) filename = argv[1];
+    if (argc >= 3) DEBUG_CASE_FILENAME = argv[2]; // optional: pass filename to debug only that case
+    DEBUG = true;
 
-    std::ifstream in(filename);
-    if (!in.is_open()) {
-        std::cerr << "Failed to open input file: " << filename << std::endl;
-        return 1;
+    int n,m;
+    vector<vector<double>> A;
+    vector<double> b;
+    vector<string> rels;
+    vector<double> c;
+    bool maximize;
+    if (!parse_input_file(filename, n, m, A, b, rels, c, maximize)) {
+        cerr << "Parse failed\n"; return 1;
     }
 
-    auto toLower = [](std::string s){
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        return s;
-    };
+    SimplexCLRS solver(n,m,A,b,rels, maximize);
+    solver.setOriginalObjective(c);
+    SimplexResult res = solver.solve(filename);
 
-    std::string token;
-    if (!(in >> token)) {
-        std::cerr << "Empty input file." << std::endl;
-        return 1;
+    if (res.status == SolveStatus::INFEASIBLE) {
+        cout << "INFEASIBLE\n";
+    } else if (res.status == SolveStatus::UNBOUNDED) {
+        cout << "UNBOUNDED\n";
+    } else {
+        cout << "OPTIMAL\n";
+        cout << "Objective = " << res.objective << "\n";
+        for (int i=0;i<(int)res.x.size();++i) cout << "x" << (i+1) << " = " << res.x[i] << "\n";
     }
-    std::string opt = toLower(token);
-    if (opt != "max" && opt != "min") {
-        std::cerr << "First token must be 'max' or 'min' (found '" << token << "')." << std::endl;
-        return 1;
-    }
-
-    int m, n;
-    if (!(in >> m >> n)) {
-        std::cerr << "Expecting two integers: m n (constraints, variables)." << std::endl;
-        return 1;
-    }
-    if (m <= 0 || n <= 0) {
-        std::cerr << "m and n must be positive." << std::endl;
-        return 1;
-    }
-
-    std::vector<double> obj(n);
-    for (int i = 0; i < n; ++i) {
-        if (!(in >> obj[i])) {
-            std::cerr << "Expecting " << n << " objective coefficients." << std::endl;
-            return 1;
-        }
-    }
-
-    std::string line;
-    std::getline(in, line); // consume rest of line after objective coefficients
-
-    int totalCols = n + m; // originals + one slack per constraint
-    std::vector<std::vector<float>> A(m, std::vector<float>(totalCols, 0.0f));
-    std::vector<float> B(m, 0.0f);
-
-    for (int i = 0; i < m; ++i) {
-        if (!std::getline(in, line)) {
-            std::cerr << "Expecting " << m << " constraint lines but file ended early." << std::endl;
-            return 1;
-        }
-        if (line.find_first_not_of(" \t\r\n") == std::string::npos) { --i; continue; } // skip blank lines
-
-        std::stringstream ss(line);
-        std::vector<double> coeffs(n);
-        for (int j = 0; j < n; ++j) {
-            if (!(ss >> coeffs[j])) {
-                std::cerr << "Constraint " << (i+1) << ": expecting " << n << " coefficients." << std::endl;
-                return 1;
-            }
-        }
-        std::string rel;
-        if (!(ss >> rel)) {
-            std::cerr << "Constraint " << (i+1) << ": missing relation (<= or >=)." << std::endl;
-            return 1;
-        }
-        double rhs;
-        if (!(ss >> rhs)) {
-            std::cerr << "Constraint " << (i+1) << ": missing RHS value." << std::endl;
-            return 1;
-        }
-
-        if (rel == ">=") {
-            for (int j = 0; j < n; ++j) coeffs[j] = -coeffs[j];
-            rhs = -rhs;
-        } else if (rel != "<=") {
-            std::cerr << "Constraint " << (i+1) << ": relation must be '<=' or '>=' (found '" << rel << "')." << std::endl;
-            return 1;
-        }
-
-        for (int j = 0; j < n; ++j) A[i][j] = static_cast<float>(coeffs[j]);
-        A[i][n + i] = 1.0f; // slack variable
-        B[i] = static_cast<float>(rhs);
-    }
-
-    // Build solver C vector using the internal sign convention:
-    // for 'max' we use C[0..n-1] = -obj (slack coeffs are 0)
-    std::vector<float> C(totalCols, 0.0f);
-    if (opt == "max") {
-        for (int i = 0; i < n; ++i) C[i] = static_cast<float>(-obj[i]);
-    } else { // min -> convert to equivalent max
-        for (int i = 0; i < n; ++i) C[i] = static_cast<float>(obj[i]);
-    }
-
-    std::cout << "Parsed problem: constraints=" << m << " originals=" << n
-              << " totalColumns=" << totalCols << std::endl;
-
-    // Construct and run Simplex (assumes Simplex available and API unchanged)
-    Simplex solver(A, B, C);
-    solver.CalculateSimplex();
-
-    // If available, print getters (many implementations expose these)
-    // (If your Simplex does not have getMaximum()/getSolution(), remove the lines below)
-    try {
-        std::vector<float> sol = solver.getSolution();
-        float maxv = solver.getMaximum();
-        std::cout << "\nResult (from getters):\n";
-        for (size_t i = 0; i < sol.size(); ++i) {
-            std::cout << "x" << (i+1) << " = " << sol[i] << "\n";
-        }
-        std::cout << "Objective = " << maxv << std::endl;
-    } catch (...) {
-        // if getters not present, ignore
-    }
-
     return 0;
 }
